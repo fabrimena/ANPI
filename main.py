@@ -17,6 +17,7 @@ from scipy.stats import pearsonr
 import math
 import argparse
 import os
+import pickle
 
 # ---------- Utilidades métricas ----------
 def mse(x, y):
@@ -156,6 +157,8 @@ def cs_compress_reconstruct(signal_vec, Phi, frame_len, method='pinv', overlap=0
     - overlap: cantidad de muestras que se solapan entre frames (por ejemplo 0 o n//2)
     - verbose: mostrar progreso
     - use_window: aplicar ventana de Hann para suavizar transiciones
+    
+    Returns: recon (señal reconstruida)
     """
     n = frame_len
     assert Phi.shape[1] == n, "Phi debe tener n columnas."
@@ -182,6 +185,7 @@ def cs_compress_reconstruct(signal_vec, Phi, frame_len, method='pinv', overlap=0
     while idx + n <= len(signal_vec):
         x = signal_vec[idx:idx+n].astype(float)
         y = compress_frame(Phi, x)
+        
         if method == 'pinv':
             xhat = reconstruct_via_pinv(Phi, y)
         elif method == 'newton':
@@ -199,10 +203,183 @@ def cs_compress_reconstruct(signal_vec, Phi, frame_len, method='pinv', overlap=0
     # normalizar solapamientos
     nonzero = weight > 0
     recon[nonzero] /= weight[nonzero]
+    
     return recon[:len(signal_vec)-pad]  # recortar padding
 
+# ---------- Compresión mejorada que retorna mediciones ----------
+def cs_compress_only(signal_vec, Phi, frame_len, overlap=0, verbose=False):
+    """
+    Comprime el audio y retorna solo las mediciones (sin reconstruir).
+    Esto es lo que realmente se transmitiría/guardaría.
+    """
+    n = frame_len
+    m = Phi.shape[0]
+    assert Phi.shape[1] == n, "Phi debe tener n columnas."
+    step = n - overlap
+    idx = 0
+    
+    # zero-pad al final si hace falta
+    pad = (-(len(signal_vec) - n) % step) if len(signal_vec) < n or (len(signal_vec)-n)%step != 0 else 0
+    if pad > 0:
+        signal_vec = np.concatenate([signal_vec, np.zeros(pad)])
+    
+    measurements = []  # Lista de vectores de medición (cada uno de tamaño m)
+    
+    while idx + n <= len(signal_vec):
+        x = signal_vec[idx:idx+n].astype(float)
+        y = compress_frame(Phi, x)  # Vector de m mediciones
+        measurements.append(y)
+        idx += step
+        
+        if verbose and len(measurements) % 1000 == 0:
+            print(f"Comprimidos {len(measurements)} frames...")
+    
+    # Convertir a array 2D: (num_frames, m)
+    measurements = np.array(measurements, dtype=np.float32)
+    
+    return measurements, pad, len(signal_vec) - pad
+# ---------- Guardar y cargar archivos comprimidos ----------
+def save_compressed(measurements, Phi_seed, sr, frame_len, overlap, method, filepath, original_samples, m):
+    """
+    Guarda SOLO las mediciones comprimidas y el seed de Phi.
+    Cuantiza mediciones a int16 para reducir tamaño (como MP3/AAC hacen).
+    """
+    # CLAVE: Cuantizar a int16 (2 bytes) en lugar de float32 (4 bytes)
+    # Encontrar rango de mediciones
+    measurements_min = measurements.min()
+    measurements_max = measurements.max()
+    measurements_range = measurements_max - measurements_min
+    
+    if measurements_range == 0:
+        measurements_range = 1.0
+    
+    # Normalizar a [-1, 1] y cuantizar a int16
+    measurements_norm = (measurements - measurements_min) / measurements_range * 2 - 1
+    measurements_int16 = np.int16(measurements_norm * 32767)
+    
+    package = {
+        'measurements_int16': measurements_int16,  # int16 (2 bytes) en lugar de float32 (4 bytes)
+        'measurements_min': np.float32(measurements_min),  # Para des-cuantizar
+        'measurements_max': np.float32(measurements_max),
+        'Phi_seed': Phi_seed,
+        'sr': sr,
+        'frame_len': frame_len,
+        'overlap': overlap,
+        'method': method,
+        'original_samples': original_samples,
+        'm': m
+    }
+    
+    with open(filepath, 'wb') as f:
+        pickle.dump(package, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    # Calcular tamaños
+    compressed_size = os.path.getsize(filepath)
+    original_size_estimate = original_samples * 2 + 44  # int16 + header WAV
+    compression_ratio = (compressed_size / original_size_estimate) * 100
+    
+    # Calcular compresión real de muestras
+    num_measurements = measurements_int16.size
+    num_original = original_samples
+    sample_compression = (num_measurements / num_original) * 100
+    
+    print(f"\n Archivo comprimido guardado: {filepath}")
+    print(f"Compresión de MUESTRAS: {sample_compression:.1f}% ({num_measurements:,} de {num_original:,} muestras)")
+    print(f"Tamaño original: {original_size_estimate/1024:.2f} KB")
+    print(f"Tamaño comprimido: {compressed_size/1024:.2f} KB")
+    print(f"Ratio de archivo: {compression_ratio:.1f}%")
+    
+    if compression_ratio < 100:
+        savings = 100 - compression_ratio
+        print(f"¡Archivo más pequeño! ({savings:.1f}% de ahorro)")
+    elif compression_ratio < 120:
+        print(f"Overhead moderado (archivo un poco más grande)")
+    else:
+        print(f"Overhead alto (mejor para archivos largos)")
+
+def load_and_reconstruct(filepath, verbose=False):
+    """Carga un archivo comprimido y reconstruye el audio."""
+    with open(filepath, 'rb') as f:
+        package = pickle.load(f)
+    
+    # Des-cuantizar mediciones de int16 a float64
+    measurements_int16 = package['measurements_int16']
+    measurements_min = package['measurements_min']
+    measurements_max = package['measurements_max']
+    measurements_range = measurements_max - measurements_min
+    
+    # Convertir int16 -> float normalizado -> rango original
+    measurements_norm = measurements_int16.astype(np.float64) / 32767.0
+    measurements = (measurements_norm + 1) / 2 * measurements_range + measurements_min
+    
+    Phi_seed = package['Phi_seed']
+    sr = package['sr']
+    frame_len = package['frame_len']
+    overlap = package['overlap']
+    method = package['method']
+    original_samples = package['original_samples']
+    m = package['m']
+    
+    # Regenerar Phi desde el seed
+    np.random.seed(Phi_seed)
+    Phi = np.random.normal(0, 1.0, size=(m, frame_len))
+    Phi = Phi / np.linalg.norm(Phi, axis=1, keepdims=True)
+    
+    print(f"\n Descomprimiendo: {filepath}")
+    print(f"   Sample rate: {sr} Hz")
+    print(f"   Frame: {frame_len}, m: {m}, Overlap: {overlap}")
+    print(f"   Tasa de compresión de muestras: {(m/frame_len)*100:.1f}%")
+    print(f"   Método: {method}")
+    
+    # Reconstruir señal frame por frame
+    n = frame_len
+    step = n - overlap
+    num_frames = measurements.shape[0]
+    
+    # Estimar longitud de señal
+    signal_length = (num_frames - 1) * step + n
+    recon = np.zeros(signal_length, dtype=float)
+    weight = np.zeros(signal_length, dtype=float)
+    
+    # Pre-calcular pseudoinversa si es newton
+    if method == 'newton':
+        if verbose:
+            print("Calculando pseudoinversa...")
+        _pseudoinv_cache.clear()  # Limpiar caché anterior
+        pseudoinv_via_newton(Phi, cache_key='Phi')
+    
+    if verbose:
+        print(f"   Reconstruyendo {num_frames} frames...")
+    
+    idx = 0
+    for i, y in enumerate(measurements):
+        if method == 'pinv':
+            xhat = reconstruct_via_pinv(Phi, y)
+        elif method == 'newton':
+            xhat = reconstruct_via_newton(Phi, y)
+        else:
+            raise ValueError(f"Método desconocido: {method}")
+        
+        recon[idx:idx+n] += xhat
+        weight[idx:idx+n] += 1.0
+        idx += step
+        
+        if verbose and (i+1) % 1000 == 0:
+            print(f"Procesados {i+1}/{num_frames} frames ({100*(i+1)/num_frames:.1f}%)")
+    
+    # Normalizar overlap
+    nonzero = weight > 0
+    recon[nonzero] /= weight[nonzero]
+    
+    # Truncar a longitud original
+    recon = recon[:original_samples]
+    
+    print(f" Reconstrucción completada: {len(recon)} muestras")
+    
+    return recon, sr
+
 # ---------- Ejemplo de uso con un .wav ----------
-def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0, plot=True, max_duration=None):
+def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0, plot=True, max_duration=None, save_compressed_file=False):
     sr, data = wavfile.read(wav_path)
     
     # normalizar PRIMERO a float antes de hacer mean para evitar overflow
@@ -235,7 +412,32 @@ def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0
     print(f"SR={sr}, samples={len(data)}, frame={frame_len}, m={m_measure}, método={method}")
     print(f"Rango de datos: [{data.min():.3f}, {data.max():.3f}]")
     print(f"Tasa de compresión: {compression_percent:.1f}% (m/n = {m_measure}/{frame_len})")
-    recon = cs_compress_reconstruct(data, Phi, frame_len, method=method, overlap=overlap, verbose=True, use_window=False)
+    
+    # Si vamos a guardar, comprimir primero y reconstruir después
+    if save_compressed_file:
+        # Comprimir (obtener solo mediciones)
+        measurements, pad, original_length = cs_compress_only(data, Phi, frame_len, overlap=overlap, verbose=True)
+        
+        # Guardar archivo comprimido (con seed de Phi en lugar de toda la matriz)
+        base_name = os.path.splitext(os.path.basename(wav_path))[0]
+        compressed_path = f"{base_name}_compressed.pkl"
+        save_compressed(measurements, 42, sr, frame_len, overlap, method, compressed_path, len(data), m_measure)  # seed=42
+        
+        # Reconstruir desde las mediciones
+        print("\nReconstruyendo audio desde mediciones comprimidas...")
+        recon = cs_compress_reconstruct(data, Phi, frame_len, method=method, overlap=overlap, verbose=True, use_window=False)
+        
+        # Guardar audio reconstruido como WAV (con clipping para evitar ruido)
+        reconstructed_path = f"{base_name}_reconstructed.wav"
+        # Clip values to [-1, 1] y convertir a int16
+        recon_clipped = np.clip(recon, -1.0, 1.0)
+        recon_int16 = np.int16(recon_clipped * 32767)
+        wavfile.write(reconstructed_path, sr, recon_int16)
+        print(f"Audio reconstruido guardado: {reconstructed_path}")
+    else:
+        # Solo reconstruir sin guardar
+        recon = cs_compress_reconstruct(data, Phi, frame_len, method=method, overlap=overlap, verbose=True, use_window=False)
+    
     # métricas
     mse_val = mse(data, recon)
     psnr_val = psnr(data, recon, data_range=1.0)
@@ -269,15 +471,31 @@ def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0
 
 # ---------- CLI simple ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CS audio example")
-    parser.add_argument("--wav", type=str, required=True, help="Ruta al archivo .wav")
+    parser = argparse.ArgumentParser(description="CS audio compression and reconstruction")
+    parser.add_argument("--wav", type=str, help="Ruta al archivo .wav para comprimir")
     parser.add_argument("--frame", type=int, default=512, help="Tamaño de frame n")
     parser.add_argument("--m", type=int, default=256, help="Número de mediciones m (filas de Phi)")
     parser.add_argument("--method", type=str, default="newton", choices=["pinv","newton"], help="Reconstrucción via pinv o newton")
     parser.add_argument("--overlap", type=int, default=495, help="Overlap en muestras")
     parser.add_argument("--duration", type=float, default=10.0, help="Duración máxima en segundos (default: 10s)")
+    parser.add_argument("--save", action="store_true", help="Guardar archivo comprimido y reconstruido")
+    parser.add_argument("--decompress", type=str, help="Descomprimir un archivo .pkl y guardar como WAV")
     args = parser.parse_args()
-    if not os.path.exists(args.wav):
-        raise FileNotFoundError("No se encontró el archivo wav.")
-    run_example(args.wav, frame_len=args.frame, m_measure=args.m, method=args.method, 
-                overlap=args.overlap, max_duration=args.duration)
+    
+    if args.decompress:
+        # Modo descompresión
+        recon, sr = load_and_reconstruct(args.decompress, verbose=True)
+        output_path = args.decompress.replace('_compressed.pkl', '_decompressed.wav')
+        # Clip values para evitar ruido estático
+        recon_clipped = np.clip(recon, -1.0, 1.0)
+        recon_int16 = np.int16(recon_clipped * 32767)
+        wavfile.write(output_path, sr, recon_int16)
+        print(f"\nAudio descomprimido guardado: {output_path}")
+    elif args.wav:
+        # Modo compresión
+        if not os.path.exists(args.wav):
+            raise FileNotFoundError("No se encontró el archivo wav.")
+        run_example(args.wav, frame_len=args.frame, m_measure=args.m, method=args.method, 
+                    overlap=args.overlap, max_duration=args.duration, save_compressed_file=args.save)
+    else:
+        parser.print_help()
