@@ -207,15 +207,36 @@ def cs_compress_reconstruct(signal_vec, Phi, frame_len, method='pinv', overlap=0
     return recon[:len(signal_vec)-pad]  # recortar padding
 
 # ---------- Compresión mejorada que retorna mediciones ----------
-def cs_compress_only(signal_vec, Phi, frame_len, overlap=0, verbose=False):
+def cs_compress_only(signal_vec, Phi, frame_len, overlap=0, verbose=False, max_overlap_for_storage=None):
     """
     Comprime el audio y retorna solo las mediciones (sin reconstruir).
     Esto es lo que realmente se transmitiría/guardaría.
+    
+    Args:
+        max_overlap_for_storage: Si se especifica, reduce el overlap a este valor
+                                 para almacenamiento eficiente (evita redundancia masiva)
     """
     n = frame_len
     m = Phi.shape[0]
     assert Phi.shape[1] == n, "Phi debe tener n columnas."
-    step = n - overlap
+    
+    # Usar overlap reducido si se especifica (para almacenamiento)
+    actual_overlap = max_overlap_for_storage if max_overlap_for_storage is not None else overlap
+    step = n - actual_overlap
+    
+    # Validación: overlap no puede ser >= frame_len
+    if step <= 0:
+        raise ValueError(f"Overlap ({actual_overlap}) debe ser menor que frame_len ({n}). Step resultante: {step}")
+    
+    # Advertencia si overlap es muy alto (>90%)
+    overlap_percent = (actual_overlap / n) * 100
+    if overlap_percent > 90 and verbose:
+        print(f"⚠️  ADVERTENCIA: Overlap muy alto ({overlap_percent:.1f}%)")
+        print(f"   Esto generará {len(signal_vec)//step:,} frames con mucha redundancia.")
+        print(f"   Archivo comprimido será ~{overlap_percent/50:.1f}x más grande de lo esperado.")
+        if max_overlap_for_storage is None:
+            print(f"   Considera usar max_overlap_for_storage para reducir tamaño.")
+    
     idx = 0
     
     # zero-pad al final si hace falta
@@ -237,13 +258,19 @@ def cs_compress_only(signal_vec, Phi, frame_len, overlap=0, verbose=False):
     # Convertir a array 2D: (num_frames, m)
     measurements = np.array(measurements, dtype=np.float32)
     
-    return measurements, pad, len(signal_vec) - pad
+    return measurements, pad, len(signal_vec) - pad, actual_overlap
 # ---------- Guardar y cargar archivos comprimidos ----------
-def save_compressed(measurements, Phi_seed, sr, frame_len, overlap, method, filepath, original_samples, m):
+def save_compressed(measurements, Phi_seed, sr, frame_len, overlap, method, filepath, original_samples, m, reconstruction_overlap=None):
     """
     Guarda SOLO las mediciones comprimidas y el seed de Phi.
     Cuantiza mediciones a int16 para reducir tamaño (como MP3/AAC hacen).
+    
+    Args:
+        overlap: Overlap usado para COMPRIMIR (afecta número de frames guardados)
+        reconstruction_overlap: Overlap a usar para RECONSTRUIR (puede ser mayor para mejor calidad)
     """
+    if reconstruction_overlap is None:
+        reconstruction_overlap = overlap
     # CLAVE: Cuantizar a int16 (2 bytes) en lugar de float32 (4 bytes)
     # Encontrar rango de mediciones
     measurements_min = measurements.min()
@@ -264,7 +291,8 @@ def save_compressed(measurements, Phi_seed, sr, frame_len, overlap, method, file
         'Phi_seed': Phi_seed,
         'sr': sr,
         'frame_len': frame_len,
-        'overlap': overlap,
+        'overlap': overlap,  # Overlap usado para comprimir
+        'reconstruction_overlap': reconstruction_overlap,  # Overlap para reconstruir
         'method': method,
         'original_samples': original_samples,
         'm': m
@@ -315,7 +343,8 @@ def load_and_reconstruct(filepath, verbose=False):
     Phi_seed = package['Phi_seed']
     sr = package['sr']
     frame_len = package['frame_len']
-    overlap = package['overlap']
+    overlap = package['overlap']  # Overlap usado al comprimir
+    reconstruction_overlap = package.get('reconstruction_overlap', overlap)  # Overlap para reconstruir
     method = package['method']
     original_samples = package['original_samples']
     m = package['m']
@@ -327,13 +356,15 @@ def load_and_reconstruct(filepath, verbose=False):
     
     print(f"\n Descomprimiendo: {filepath}")
     print(f"   Sample rate: {sr} Hz")
-    print(f"   Frame: {frame_len}, m: {m}, Overlap: {overlap}")
+    print(f"   Frame: {frame_len}, m: {m}")
+    print(f"   Overlap (compresión): {overlap}, Overlap (reconstrucción): {reconstruction_overlap}")
     print(f"   Tasa de compresión de muestras: {(m/frame_len)*100:.1f}%")
     print(f"   Método: {method}")
     
-    # Reconstruir señal frame por frame
+    # Reconstruir señal frame por frame usando el overlap de reconstrucción
     n = frame_len
-    step = n - overlap
+    step = n - overlap  # Step con el que se comprimió
+    recon_step = n - reconstruction_overlap  # Step para reconstruir (puede ser menor)
     num_frames = measurements.shape[0]
     
     # Estimar longitud de señal
@@ -362,7 +393,7 @@ def load_and_reconstruct(filepath, verbose=False):
         
         recon[idx:idx+n] += xhat
         weight[idx:idx+n] += 1.0
-        idx += step
+        idx += step  # Usar step de compresión para avanzar correctamente
         
         if verbose and (i+1) % 1000 == 0:
             print(f"Procesados {i+1}/{num_frames} frames ({100*(i+1)/num_frames:.1f}%)")
@@ -379,7 +410,7 @@ def load_and_reconstruct(filepath, verbose=False):
     return recon, sr
 
 # ---------- Ejemplo de uso con un .wav ----------
-def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0, plot=True, max_duration=None, save_compressed_file=False):
+def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0, plot=True, max_duration=None, save_compressed_file=False, storage_overlap=None):
     sr, data = wavfile.read(wav_path)
     
     # normalizar PRIMERO a float antes de hacer mean para evitar overflow
@@ -415,13 +446,25 @@ def run_example(wav_path, frame_len=512, m_measure=256, method='pinv', overlap=0
     
     # Si vamos a guardar, comprimir primero y reconstruir después
     if save_compressed_file:
-        # Comprimir (obtener solo mediciones)
-        measurements, pad, original_length = cs_compress_only(data, Phi, frame_len, overlap=overlap, verbose=True)
+        # Si no se especifica storage_overlap, usar un valor razonable (max 50% del frame)
+        if storage_overlap is None:
+            storage_overlap = min(overlap, frame_len // 2)
+            if overlap > storage_overlap:
+                print(f"\n💡 INFO: Reduciendo overlap de {overlap} a {storage_overlap} para almacenamiento eficiente.")
+                print(f"   (La reconstrucción usará overlap={overlap} para mantener calidad)\n")
+        
+        # Comprimir (obtener solo mediciones) con overlap reducido
+        measurements, pad, original_length, actual_overlap = cs_compress_only(
+            data, Phi, frame_len, overlap=overlap, verbose=True, 
+            max_overlap_for_storage=storage_overlap
+        )
         
         # Guardar archivo comprimido (con seed de Phi en lugar de toda la matriz)
         base_name = os.path.splitext(os.path.basename(wav_path))[0]
         compressed_path = f"{base_name}_compressed.pkl"
-        save_compressed(measurements, 42, sr, frame_len, overlap, method, compressed_path, len(data), m_measure)  # seed=42
+        # Guardar con el overlap REAL usado para comprimir (actual_overlap), 
+        # pero también guardar el overlap original para reconstrucción
+        save_compressed(measurements, 42, sr, frame_len, actual_overlap, method, compressed_path, len(data), m_measure, reconstruction_overlap=overlap)  # seed=42
         
         # Reconstruir desde las mediciones
         print("\nReconstruyendo audio desde mediciones comprimidas...")
@@ -476,7 +519,8 @@ if __name__ == "__main__":
     parser.add_argument("--frame", type=int, default=512, help="Tamaño de frame n")
     parser.add_argument("--m", type=int, default=256, help="Número de mediciones m (filas de Phi)")
     parser.add_argument("--method", type=str, default="newton", choices=["pinv","newton"], help="Reconstrucción via pinv o newton")
-    parser.add_argument("--overlap", type=int, default=495, help="Overlap en muestras")
+    parser.add_argument("--overlap", type=int, default=510, help="Overlap en muestras (para reconstrucción)")
+    parser.add_argument("--storage-overlap", type=int, default=None, help="Overlap para almacenamiento (reduce tamaño archivo). Si no se especifica, usa max(overlap, frame/2)")
     parser.add_argument("--duration", type=float, default=10.0, help="Duración máxima en segundos (default: 10s)")
     parser.add_argument("--save", action="store_true", help="Guardar archivo comprimido y reconstruido")
     parser.add_argument("--decompress", type=str, help="Descomprimir un archivo .pkl y guardar como WAV")
@@ -496,6 +540,7 @@ if __name__ == "__main__":
         if not os.path.exists(args.wav):
             raise FileNotFoundError("No se encontró el archivo wav.")
         run_example(args.wav, frame_len=args.frame, m_measure=args.m, method=args.method, 
-                    overlap=args.overlap, max_duration=args.duration, save_compressed_file=args.save)
+                    overlap=args.overlap, max_duration=args.duration, save_compressed_file=args.save,
+                    storage_overlap=args.storage_overlap)
     else:
         parser.print_help()
