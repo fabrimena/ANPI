@@ -1,322 +1,265 @@
+"""
+This script:
+ - reads header and payload
+ - regenerates A using seed
+ - builds A_pinv (use np.linalg.pinv as robust Moore-Penrose)
+ - reconstructs each frame: X_hat = A_pinv @ Y_frame
+ - writes WAV and (optionally) prints metrics vs original
+"""
 import numpy as np
-import soundfile as sf
-from scipy.fftpack import idct
-import matplotlib.pyplot as plt
-import time
-import pickle
+from scipy.io import wavfile
+import struct
+import argparse
 import os
-import warnings
-warnings.filterwarnings('ignore')
+import time
+import matplotlib.pyplot as plt
 
-class AudioDecompressor:
-    """
-    Descompresion de audio usando Compressive Sensing + DCT
-    Basado en el paper: "Provably secure and efficient audio compression 
-    based on compressive sensing" (Abood et al., 2023)
-    """
-    
-    def __init__(self, compression_rate, frame_size):
-        self.compression_rate = compression_rate
-        self.frame_size = frame_size
-        self.num_coeffs = int(frame_size * compression_rate)
-        
-        print(f"Configuracion de descompresion:")
-        print(f"  - Frame size: {self.frame_size}")
-        print(f"  - Coeficientes: {self.num_coeffs} ({compression_rate*100}%)")
-        print(f"  - DCT: Activado")
-    
-    def generate_measurement_matrix(self, seed):
-        """Regenera la matriz Gaussiana con la semilla original"""
-        np.random.seed(seed)
-        matrix = np.random.randn(self.num_coeffs, self.num_coeffs)
-        matrix = matrix / np.sqrt(self.num_coeffs)
-        return matrix
-    
-    def reconstruct_audio(self, compressed_signal, original_length, seed, max_val):
-        """
-        Reconstruccion usando Moore-Penrose pseudoinverse (Algorithm 2 del paper):
-        1. Regenerar matriz de medicion con la semilla
-        2. Calcular pseudoinversa de Moore-Penrose (Ecuacion 6)
-        3. Desencriptar coeficientes (X = A+ * Y)
-        4. Rellenar coeficientes DCT con ceros
-        5. Aplicar IDCT para reconstruir senal temporal
-        """
-        start_time = time.time()
-        
-        # Regenerar matriz de medicion
-        measurement_matrix = self.generate_measurement_matrix(seed)
-        
-        # Calcular pseudoinversa de Moore-Penrose (Ecuacion 6 del paper)
-        # A+ = A^T * (A * A^T)^-1
-        pseudoinverse = np.linalg.pinv(measurement_matrix)
-        
-        # Dividir en frames
-        num_frames = len(compressed_signal) // self.num_coeffs
-        compressed_frames = compressed_signal.reshape(num_frames, self.num_coeffs)
-        
-        reconstructed_frames = []
-        
-        for encrypted_coeffs in compressed_frames:
-            # Desencriptar usando pseudoinversa (Ecuacion 7)
-            sparse_coeffs = pseudoinverse @ encrypted_coeffs
-            
-            # Rellenar coeficientes DCT con ceros
-            full_dct_coeffs = np.zeros(self.frame_size)
-            full_dct_coeffs[:self.num_coeffs] = sparse_coeffs
-            
-            # Aplicar IDCT para reconstruir frame temporal
-            reconstructed_frame = idct(full_dct_coeffs, norm='ortho')
-            
-            reconstructed_frames.append(reconstructed_frame)
-        
-        # Concatenar frames y recortar al tamano original
-        reconstructed_signal = np.concatenate(reconstructed_frames)[:original_length]
-        
-        # Desnormalizar
-        reconstructed_signal = reconstructed_signal * max_val
-        
-        stats = {'reconstruction_time': time.time() - start_time}
-        
-        return reconstructed_signal, stats
-    
-    def load_compressed(self, filename):
-        """Carga datos comprimidos"""
-        with open(filename, 'rb') as f:
-            package = pickle.load(f)
-        
-        compressed_signal = (
-            package['compressed_data'].astype(np.float64) / 32767.0 * 
-            package['max_compressed']
-        )
-        
-        return compressed_signal, package
-    
-    def evaluate_reconstruction(self, original, reconstructed):
-        """
-        Metricas de calidad segun el paper (Seccion 4.2, 4.3, 4.4):
-        - Pearson Correlation (R)
-        - MSE (Mean Square Error)
-        - PSNR (Peak Signal-to-Noise Ratio)
-        - SSIM (Structural Similarity Index)
-        """
-        
-        # 1. Pearson Correlation (Seccion 4.2)
-        correlation = np.corrcoef(original, reconstructed)[0, 1]
-        
-        # 2. MSE (Seccion 4.3)
-        mse = np.mean((original - reconstructed) ** 2)
-        
-        # 3. PSNR (Seccion 4.3)
-        max_val = np.max(np.abs(original))
-        if mse > 0:
-            psnr = 10 * np.log10((max_val ** 2) / mse)
+MAGIC = b'CSRB'
+VERSION = 1
+
+def read_header_and_payload(binfile):
+    with open(binfile, 'rb') as f:
+        header_bytes = f.read(32)  # fixed header size as in compressor
+        if len(header_bytes) < 32:
+            raise ValueError("Archivo demasiado corto o header corrupto.")
+        magic, ver, quant_flag, seed, k, n, m, num_frames, fs, orig_len, scale = struct.unpack('<4sBBIHHHIII f', header_bytes)
+        if magic != MAGIC:
+            raise ValueError("Magic header no coincide. ¿Es un archivo CS raw correcto?")
+        if ver != VERSION:
+            raise ValueError(f"Version mismatch: found {ver}, expected {VERSION}")
+
+        # compute expected payload length
+        count_values = num_frames * m * n
+        if quant_flag == 1:
+            payload_bytes = count_values  # int8 -> 1 byte each
         else:
-            psnr = float('inf')
-        
-        # 4. SSIM (Seccion 4.4)
-        mean_x = np.mean(original)
-        mean_y = np.mean(reconstructed)
-        var_x = np.var(original)
-        var_y = np.var(reconstructed)
-        cov_xy = np.mean((original - mean_x) * (reconstructed - mean_y))
-        
-        # Constantes para evitar division por cero
-        L = max_val  # Rango de valores
-        c1 = (0.01 * L) ** 2
-        c2 = (0.03 * L) ** 2
-        
-        ssim = ((2 * mean_x * mean_y + c1) * (2 * cov_xy + c2)) / \
-               ((mean_x**2 + mean_y**2 + c1) * (var_x + var_y + c2))
-        
-        return {
-            'Correlation': correlation,
-            'MSE': mse,
-            'PSNR': psnr,
-            'SSIM': ssim
-        }
+            payload_bytes = count_values * 4  # float32
+
+        payload = f.read(payload_bytes)
+        if len(payload) != payload_bytes:
+            raise ValueError("Payload incomplete/corrupt.")
+
+    header = {
+        'quant': bool(quant_flag),
+        'seed': int(seed),
+        'k': int(k),
+        'n': int(n),
+        'm': int(m),
+        'num_frames': int(num_frames),
+        'fs': int(fs),
+        'orig_len': int(orig_len),
+        'scale': float(scale)
+    }
+    return header, payload
+
+def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
+    header, payload = read_header_and_payload(binfile)
+    quant = header['quant']
+    seed = header['seed']
+    k = header['k']; n = header['n']; m = header['m']
+    num_frames = header['num_frames']
+    fs = header['fs']
+    orig_len = header['orig_len']
+    scale = header['scale']
+
+    count_values = num_frames * m * n
+
+    # interpret payload
+    if quant:
+        Y_all = np.frombuffer(payload, dtype=np.int8, count=count_values).astype(np.float64)
+        # reshape to (num_frames, m, n)
+        Y_all = Y_all.reshape((num_frames, m, n))
+        # dequantize:
+        if scale <= 0:
+            raise ValueError("Scale inválida en archivo cuantizado.")
+        Y_all = Y_all * scale
+    else:
+        Y_all = np.frombuffer(payload, dtype=np.float32, count=count_values).astype(np.float64)
+        Y_all = Y_all.reshape((num_frames, m, n))
+
+    # Algorithm 2 del paper: regenerar matriz de medición A (k×n)
+    np.random.seed(seed)
+    A = np.random.randn(k, n).astype(np.float64)
+
+    # ========== MÉTODO ITERATIVO: Newton-Schultz para aproximar pseudoinversa ==========
+    print("\n" + "="*70)
+    print("MÉTODO ITERATIVO: Newton-Schultz para Pseudoinversa de Moore-Penrose")
+    print("="*70)
     
-    def plot_comparison(self, original, compressed, reconstructed, output_file):
-        """Genera graficas comparativas"""
-        fig = plt.figure(figsize=(16, 8))
+    # Valores Iniciales (V.I.)
+    # Para A:(k×n), queremos A⁺:(n×k)
+    # Newton-Schultz: Yₖ₊₁ = Yₖ(2I - AYₖ) donde Y₀ = α·A^T
+    print("\n[1] VALORES INICIALES (V.I.):")
+    frobenius_norm_sq = np.linalg.norm(A, 'fro')**2
+    Y0 = (1.0 / frobenius_norm_sq) * A.T  # Y0: (n×k)
+    print(f"    Y₀ = (1/||A||²_F) * A^T")
+    print(f"    ||A||²_F = {frobenius_norm_sq:.6e}")
+    print(f"    Y₀ shape: {Y0.shape} (debe ser n×k)")
+    print(f"    Y₀ primeros elementos: {Y0.flat[:5]}")
+    
+    # Parámetros del método iterativo
+    tol = 1e-10
+    iterMax = 100
+    
+    # Inicializar
+    Yk = Y0.copy()  # (n×k)
+    Ik = np.eye(k)  # Matriz identidad k×k (para A:(k×n), AY:(k×k))
+    
+    # Medir tiempo de ejecución
+    start_time = time.time()
+    
+    # Iteración Newton-Schultz: Yₖ₊₁ = Yₖ(2I - AYₖ)
+    # Y:(n×k), A:(k×n), AY:(k×n)·(n×k) = (k×k), I:(k×k)
+    # Yₖ(2I - AYₖ): (n×k)·(k×k) = (n×k) ✓
+    print(f"\n[2] ITERACIONES (tolerancia = {tol:.0e}, máx iteraciones = {iterMax}):")
+    for iter_k in range(1, iterMax + 1):
+        Yk = Yk @ (2 * Ik - A @ Yk)  # (n×k) @ (k×k) = (n×k)
         
-        # Configuracion de grilla
-        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+        # Calcular error: ||A·Yₖ·A - A||_F
+        error = np.linalg.norm(A @ Yk @ A - A, 'fro')
         
-        # 1. Senal Original (completa)
-        ax1 = fig.add_subplot(gs[0, :])
-        ax1.plot(original, linewidth=0.5, color='blue', alpha=0.8)
-        ax1.set_title('Senal Original', fontsize=12, fontweight='bold')
-        ax1.set_ylabel('Amplitud', fontsize=10)
-        ax1.set_xlabel('Muestras', fontsize=10)
-        ax1.grid(True, alpha=0.3)
+        if iter_k <= 5 or iter_k % 10 == 0 or error < tol:
+            print(f"    Iteración {iter_k:3d}: error = {error:.6e}")
         
-        # 2. Senal Comprimida
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax2.plot(compressed, linewidth=0.5, color='orange', alpha=0.8)
-        ax2.set_title('Senal Comprimida (CS+DCT)', fontsize=12, fontweight='bold')
-        ax2.set_ylabel('Amplitud', fontsize=10)
-        ax2.set_xlabel('Muestras', fontsize=10)
-        ax2.grid(True, alpha=0.3)
-        
-        # 3. Senal Reconstruida (completa)
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax3.plot(reconstructed, linewidth=0.5, color='green', alpha=0.8)
-        ax3.set_title('Senal Reconstruida', fontsize=12, fontweight='bold')
-        ax3.set_ylabel('Amplitud', fontsize=10)
-        ax3.set_xlabel('Muestras', fontsize=10)
-        ax3.grid(True, alpha=0.3)
-        
-        plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f"Grafica guardada: {output_file}")
-        print("\nMostrando graficas comparativas...")
-        plt.show()
+        if error < tol:
+            break
+    
+    execution_time = time.time() - start_time
+    A_pinv = Yk
+    
+    # Resultados del método iterativo
+    print(f"\n[3] APROXIMACIÓN DE LA SOLUCIÓN:")
+    print(f"    A⁺ (pseudoinversa) shape: {A_pinv.shape}")
+    print(f"    A⁺ primeros elementos: {A_pinv.flat[:5]}")
+    
+    print(f"\n[4] ERROR FINAL:")
+    final_error = np.linalg.norm(A @ A_pinv @ A - A, 'fro')
+    print(f"    ||A·A⁺·A - A||_F = {final_error:.6e}")
+    
+    print(f"\n[5] NÚMERO DE ITERACIONES:")
+    print(f"    k = {iter_k}")
+    
+    print(f"\n[6] TIEMPO DE EJECUCIÓN:")
+    print(f"    t = {execution_time:.6f} segundos")
+    print("="*70 + "\n")
 
-
-def decompress_audio_file(compressed_file, output_file=None, original_file=None, 
-                          sample_rate=44100):
-    """
-    Funcion principal para descomprimir un archivo de audio
-    """
-    print("\n" + "=" * 70)
-    print("DESCOMPRESION DE AUDIO CON COMPRESSIVE SENSING + DCT")
+    # ========== RECONSTRUCCIÓN DE SEÑAL ==========
+    print("=" * 70)
+    print("RECONSTRUCCIÓN DE SEÑAL")
     print("=" * 70)
     
-    # Cargar archivo comprimido
-    print(f"\nCargando: {compressed_file}")
-    
-    with open(compressed_file, 'rb') as f:
-        package = pickle.load(f)
-    
-    # Crear descompresor
-    decompressor = AudioDecompressor(
-        compression_rate=package['compression_rate'],
-        frame_size=package['frame_size']
-    )
-    
-    # Cargar datos comprimidos
-    compressed_signal, _ = decompressor.load_compressed(compressed_file)
-    
-    # Reconstruir
-    print("\n" + "-" * 70)
-    print("RECONSTRUYENDO...")
-    print("-" * 70)
-    
-    reconstructed_signal, stats = decompressor.reconstruct_audio(
-        compressed_signal,
-        package['original_length'],
-        package['seed'],
-        package['max_val']
-    )
-    
-    print(f"Muestras reconstruidas: {len(reconstructed_signal)}")
-    print(f"Tiempo: {stats['reconstruction_time']:.4f}s")
-    
-    # Guardar audio reconstruido
-    if output_file is None:
-        base_name = os.path.splitext(compressed_file)[0]
-        output_file = f"{base_name}_reconstructed.wav"
-    
-    sf.write(output_file, reconstructed_signal, sample_rate)
-    print(f"\nAudio guardado: {output_file}")
-    
-    # Evaluar calidad si se proporciona el original
-    metrics = None
-    if original_file is not None:
-        print("\n" + "=" * 70)
-        print("ANALISIS DE CALIDAD (Paper: Abood et al., 2023)")
-        print("=" * 70)
-        
-        original_signal, _ = sf.read(original_file)
-        if len(original_signal.shape) > 1:
-            original_signal = original_signal[:, 0]
-        
-        metrics = decompressor.evaluate_reconstruction(original_signal, reconstructed_signal)
-        
-        print("\nMetricas de Reconstruccion:")
-        print("-" * 70)
-        print(f"Pearson Correlation (R):  {metrics['Correlation']:.6f}")
-        print(f"MSE:                      {metrics['MSE']:.6e}")
-        print(f"PSNR:                     {metrics['PSNR']:.2f} dB")
-        print(f"SSIM:                     {metrics['SSIM']:.6f}")
-        
-        # Interpretacion basada en valores del paper (Tabla 3)
-        if metrics['Correlation'] >= 0.99:
-            status = "EXCELENTE (>= 0.99)"
-        elif metrics['Correlation'] >= 0.98:
-            status = "MUY BUENA (>= 0.98)"
-        elif metrics['Correlation'] >= 0.95:
-            status = "BUENA (>= 0.95)"
-        elif metrics['Correlation'] >= 0.90:
-            status = "REGULAR (>= 0.90)"
-        else:
-            status = "BAJA (< 0.90)"
-        
-        print(f"\nCalidad de Reconstruccion: {status}")
-        print("-" * 70)
-        
-        # Generar graficas comparativas
-        print("\n" + "-" * 70)
-        print("GENERANDO GRAFICAS COMPARATIVAS")
-        print("-" * 70)
-        
-        plot_file = os.path.splitext(compressed_file)[0] + '_comparison.png'
-        decompressor.plot_comparison(
-            original_signal, 
-            compressed_signal, 
-            reconstructed_signal, 
-            plot_file
-        )
-    else:
-        print("\nNota: Proporcione el archivo original con --original para ver metricas")
-    
-    print("\n" + "=" * 70)
-    print("Descompresion completada")
-    print("=" * 70 + "\n")
-    
-    return output_file, metrics
+    # Medir tiempo de reconstrucción
+    recon_start_time = time.time()
 
+    # Algorithm 2: Reconstruir X_hat = Y · A+ donde Y:(m×n), A+:(n×k) -> X:(m×k)
+    X_all = np.empty((num_frames, m, k), dtype=np.float64)
+    for i in range(num_frames):
+        Yf = Y_all[i]       # (m, n) - frame comprimido
+        X_all[i] = Yf @ A_pinv  # (m, n) @ (n, k) = (m, k) - reconstruido
+        
+        if i < 3 or i == num_frames - 1:
+            print(f"Frame {i+1} reconstruido: ||X̂||_F = {np.linalg.norm(X_all[i], 'fro'):.6f}")
+
+    # Algorithm 2: Unir todos los frames y reshape a vector 1D
+    # X_all shape: (num_frames, m, k)
+    recon = X_all.reshape(num_frames * m * k)[:orig_len]
+    
+    recon_time = time.time() - recon_start_time
+    
+    print(f"\nTiempo de reconstrucción: {recon_time:.6f} segundos")
+    print("=" * 70 + "\n")
+
+    # clip to [-1,1] and convert to int16
+    recon = np.clip(recon, -1.0, 1.0)
+    wav_int16 = (recon * 32767.0).astype(np.int16)
+    wavfile.write(out_wav, fs, wav_int16)
+
+    comp_size = os.path.getsize(binfile)
+    wav_size = os.path.getsize(out_wav)
+    print(f"Decompressed saved: {out_wav}")
+    print(f"Compressed file: {binfile} -> {comp_size:,} bytes")
+    print(f"Reconstructed WAV: {out_wav} -> {wav_size:,} bytes")
+    print(f"k={k}, n={n}, m={m}, frames={num_frames}, seed={seed}, quant={quant}, scale={scale}")
+
+    # optionally compute metrics vs original
+    metrics = None
+    if original_wav is not None:
+        fs_o, orig = wavfile.read(original_wav)
+        # Usar mismo canal que en compresión (izquierdo si es estéreo)
+        if orig.ndim > 1 and orig.shape[1] == 2:
+            orig = orig[:, 0]  # Canal izquierdo
+            print("Original estéreo: usando canal izquierdo para comparación")
+        if np.issubdtype(orig.dtype, np.integer):
+            orig_f = orig.astype(np.float64) / np.iinfo(orig.dtype).max
+        else:
+            orig_f = orig.astype(np.float64)
+        L = min(len(orig_f), len(recon))
+        orig_f = orig_f[:L]; rec = recon[:L]
+        R = float(np.corrcoef(orig_f, rec)[0,1])
+        M = float(np.mean((orig_f - rec)**2))
+        maxv = float(np.max(np.abs(orig_f))) if np.max(np.abs(orig_f))>0 else 1.0
+        PSNR = 10 * np.log10((maxv**2)/M) if M>0 else float('inf')
+        # simple SSIM 1D
+        mu_x = orig_f.mean(); mu_y = rec.mean()
+        var_x = orig_f.var(); var_y = rec.var()
+        cov = float(np.mean((orig_f - mu_x)*(rec - mu_y)))
+        Lc = max(max(abs(orig_f)),1e-12)
+        c1 = (0.01*Lc)**2; c2 = (0.03*Lc)**2
+        SSIM = ((2*mu_x*mu_y + c1) * (2*cov + c2)) / ((mu_x**2 + mu_y**2 + c1)*(var_x + var_y + c2))
+        metrics = {"Pearson":R, "MSE":M, "PSNR":PSNR, "SSIM":SSIM}
+        print("\nMetrics vs original:")
+        print(f" Pearson: {R:.6f}")
+        print(f" MSE:     {M:.6e}")
+        print(f" PSNR:    {PSNR:.3f} dB")
+        print(f" SSIM:    {SSIM:.6f}")
+        
+        # ========== GRÁFICAS COMPARATIVAS ==========
+        print("\n" + "="*70)
+        print("GENERANDO GRÁFICAS COMPARATIVAS")
+        print("="*70)
+        
+        # Crear figura con 2 subplots
+        fig, axes = plt.subplots(2, 1, figsize=(14, 8))
+        
+        # Determinar rango de muestras para visualización (primeros 50000 puntos o menos)
+        max_samples = min(50000, L)
+        time_axis = np.arange(max_samples) / fs
+        
+        # Subplot 1: Señal Original
+        axes[0].plot(time_axis, orig_f[:max_samples], 'b-', linewidth=0.5, alpha=0.7)
+        axes[0].set_title('Señal Original', fontsize=14, fontweight='bold')
+        axes[0].set_xlabel('Tiempo (s)', fontsize=11)
+        axes[0].set_ylabel('Amplitud', fontsize=11)
+        axes[0].grid(True, alpha=0.3)
+        axes[0].set_xlim([0, time_axis[-1]])
+        
+        # Subplot 2: Señal Reconstruida
+        axes[1].plot(time_axis, rec[:max_samples], 'r-', linewidth=0.5, alpha=0.7)
+        axes[1].set_title(f'Señal Reconstruida (CS + Newton-Schultz) - Pearson={R:.4f}, PSNR={PSNR:.2f} dB', 
+                         fontsize=14, fontweight='bold')
+        axes[1].set_xlabel('Tiempo (s)', fontsize=11)
+        axes[1].set_ylabel('Amplitud', fontsize=11)
+        axes[1].grid(True, alpha=0.3)
+        axes[1].set_xlim([0, time_axis[-1]])
+        
+        plt.tight_layout()
+        
+        # Guardar figura
+        fig_filename = out_wav.replace('.wav', '_comparison.png')
+        plt.savefig(fig_filename, dpi=150, bbox_inches='tight')
+        print(f"Gráfica guardada: {fig_filename}")
+        
+        # Mostrar figura
+        plt.show()
+        print("="*70)
+
+    return out_wav, metrics
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("\nUso: python decompress.py <archivo_comprimido> [opciones]")
-        print("\nOpciones:")
-        print("  --output ARCHIVO     Nombre de archivo de salida (default: auto)")
-        print("  --original ARCHIVO   Archivo original para evaluar calidad")
-        print("  --sample-rate RATE   Tasa de muestreo (default: 44100)")
-        print("\nEjemplo:")
-        print("  python decompress.py audio_50pct_f1024_dct.pkl")
-        print("  python decompress.py compressed.pkl --original audio.wav")
-        print("  python decompress.py compressed.pkl --output resultado.wav --sample-rate 22050\n")
-        sys.exit(1)
-    
-    compressed_file = sys.argv[1]
-    
-    # Parsear opciones
-    output_file = None
-    original_file = None
-    sample_rate = 44100
-    
-    i = 2
-    while i < len(sys.argv):
-        if sys.argv[i] == '--output':
-            output_file = sys.argv[i + 1]
-            i += 2
-        elif sys.argv[i] == '--original':
-            original_file = sys.argv[i + 1]
-            i += 2
-        elif sys.argv[i] == '--sample-rate':
-            sample_rate = int(sys.argv[i + 1])
-            i += 2
-        else:
-            i += 1
-    
-    # Descomprimir
-    decompress_audio_file(
-        compressed_file,
-        output_file=output_file,
-        original_file=original_file,
-        sample_rate=sample_rate
+    p = argparse.ArgumentParser(description="Decompress the raw CS binary file and optionally compute metrics")
+    p.add_argument("input", help="Compressed raw binary (.bin)")
+    p.add_argument("output", help="Output WAV file")
+    p.add_argument("--original", help="Original WAV to compute metrics (optional)", default=None)
+    args = p.parse_args()
 
-    )
+    decompress_raw(args.input, args.output, original_wav=args.original)
