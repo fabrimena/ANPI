@@ -1,4 +1,3 @@
-# compress_cs_paper_raw.py
 """
 Compact raw compressor faithful to paper but storing the sensed matrix Y in a small binary file.
 
@@ -189,3 +188,4 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     compress_raw(args.input, args.output, k=args.k, n=args.n, rate=args.rate, seed=args.seed, quantize=args.quant)
+
