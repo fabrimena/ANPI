@@ -104,15 +104,34 @@ def compress_raw(in_wav, out_bin, k=8, n=4, rate=0.5, seed=None, quantize=True):
     start_time = time.time()
     
     Y_all = np.empty((num_frames, m, n), dtype=np.float64)
+    
+    # Indices del medio del audio para mostrar (evitar inicio con silencios)
+    mid_start = num_frames // 2 - 1
+    sample_indices = [mid_start, mid_start + 1, mid_start + 2]
+    
     for i in range(num_frames):
         X = frames_raw[i]    # X shape (m, k) - frame original
         Y = X @ A            # (m, k) @ (k, n) = (m, n) - comprimido
         Y_all[i] = Y
-        
-        if i < 3 or i == num_frames - 1:
-            print(f"    Frame {i+1}: ||X||_F = {np.linalg.norm(X, 'fro'):.6f} → ||Y||_F = {np.linalg.norm(Y, 'fro'):.6f}")
     
     compression_time = time.time() - start_time
+    
+    print(f"\n    Mostrando 3 matrices del medio del audio (frames {mid_start+1}, {mid_start+2}, {mid_start+3}):")
+    print("    " + "="*65)
+    
+    for idx, frame_idx in enumerate(sample_indices, 1):
+        X = frames_raw[frame_idx]
+        Y = Y_all[frame_idx]
+        print(f"\n    MATRIZ {idx} - Frame {frame_idx+1}:")
+        print(f"    Matriz Inicial X ({m}×{k}):")
+        for row in X:
+            print(f"        [{', '.join(f'{val:9.6f}' for val in row)}]")
+        print(f"\n    Matriz Resultante Y ({m}×{n}):")
+        for row in Y:
+            print(f"        [{', '.join(f'{val:9.6f}' for val in row)}]")
+        print(f"    ||X||_F = {np.linalg.norm(X, 'fro'):.6f} → ||Y||_F = {np.linalg.norm(Y, 'fro'):.6f}")
+    
+    print("    " + "="*65)
     
     print(f"\n[4] TIEMPO DE COMPRESIÓN:")
     print(f"    t = {compression_time:.6f} segundos")
