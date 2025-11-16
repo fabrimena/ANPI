@@ -1,10 +1,15 @@
 """
-This script:
- - reads header and payload
- - regenerates A using seed
- - builds A_pinv (use np.linalg.pinv as robust Moore-Penrose)
- - reconstructs each frame: X_hat = A_pinv @ Y_frame
- - writes WAV and (optionally) prints metrics vs original
+Lee el archivo binario compacto creado por compress.py y reconstruye la señal.
+
+Uso:
+  python decompress.py compressed.bin out.wav --original original.wav
+
+Este script:
+ - lee header y payload
+ - regenera A usando seed
+ - calcula A_pinv (usando método iterativo Newton-Schultz para Moore-Penrose)
+ - reconstruye cada frame: X_hat = A_pinv @ Y_frame
+ - escribe WAV y (opcionalmente) imprime métricas vs original
 """
 import numpy as np
 from scipy.io import wavfile
@@ -19,7 +24,7 @@ VERSION = 1
 
 def read_header_and_payload(binfile):
     with open(binfile, 'rb') as f:
-        header_bytes = f.read(32)  # fixed header size as in compressor
+        header_bytes = f.read(32)  # tamaño fijo del header como en el compresor
         if len(header_bytes) < 32:
             raise ValueError("Archivo demasiado corto o header corrupto.")
         magic, ver, quant_flag, seed, k, n, m, num_frames, fs, orig_len, scale = struct.unpack('<4sBBIHHHIII f', header_bytes)
@@ -28,10 +33,10 @@ def read_header_and_payload(binfile):
         if ver != VERSION:
             raise ValueError(f"Version mismatch: found {ver}, expected {VERSION}")
 
-        # compute expected payload length
+        # calcular longitud esperada del payload
         count_values = num_frames * m * n
         if quant_flag == 1:
-            payload_bytes = count_values  # int8 -> 1 byte each
+            payload_bytes = count_values  # int8 -> 1 byte cada uno
         else:
             payload_bytes = count_values * 4  # float32
 
@@ -64,7 +69,7 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
 
     count_values = num_frames * m * n
 
-    # interpret payload
+    # interpretar payload
     if quant:
         Y_all = np.frombuffer(payload, dtype=np.int8, count=count_values).astype(np.float64)
         # reshape to (num_frames, m, n)
@@ -110,7 +115,7 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
     
     # Iteración Newton-Schultz: Yₖ₊₁ = Yₖ(2I - AYₖ)
     # Y:(n×k), A:(k×n), AY:(k×n)·(n×k) = (k×k), I:(k×k)
-    # Yₖ(2I - AYₖ): (n×k)·(k×k) = (n×k) ✓
+    # Yₖ(2I - AYₖ): (n×k)·(k×k) = (n×k)
     print(f"\n[2] ITERACIONES (tolerancia = {tol:.0e}, máx iteraciones = {iterMax}):")
     for iter_k in range(1, iterMax + 1):
         Yk = Yk @ (2 * Ik - A @ Yk)  # (n×k) @ (k×k) = (n×k)
@@ -169,7 +174,7 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
     print(f"\nTiempo de reconstrucción: {recon_time:.6f} segundos")
     print("=" * 70 + "\n")
 
-    # clip to [-1,1] and convert to int16
+    # recortar a [-1,1] y convertir a int16
     recon = np.clip(recon, -1.0, 1.0)
     wav_int16 = (recon * 32767.0).astype(np.int16)
     wavfile.write(out_wav, fs, wav_int16)
@@ -181,7 +186,7 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
     print(f"Reconstructed WAV: {out_wav} -> {wav_size:,} bytes")
     print(f"k={k}, n={n}, m={m}, frames={num_frames}, seed={seed}, quant={quant}, scale={scale}")
 
-    # optionally compute metrics vs original
+    # opcionalmente calcular métricas vs original
     metrics = None
     if original_wav is not None:
         fs_o, orig = wavfile.read(original_wav)
@@ -199,7 +204,7 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
         M = float(np.mean((orig_f - rec)**2))
         maxv = float(np.max(np.abs(orig_f))) if np.max(np.abs(orig_f))>0 else 1.0
         PSNR = 10 * np.log10((maxv**2)/M) if M>0 else float('inf')
-        # simple SSIM 1D
+        # SSIM 1D simple
         mu_x = orig_f.mean(); mu_y = rec.mean()
         var_x = orig_f.var(); var_y = rec.var()
         cov = float(np.mean((orig_f - mu_x)*(rec - mu_y)))
@@ -256,10 +261,10 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
     return out_wav, metrics
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Decompress the raw CS binary file and optionally compute metrics")
-    p.add_argument("input", help="Compressed raw binary (.bin)")
-    p.add_argument("output", help="Output WAV file")
-    p.add_argument("--original", help="Original WAV to compute metrics (optional)", default=None)
+    p = argparse.ArgumentParser(description="Descomprie el archivo binario comprimido y muestra graficas y metricas")
+    p.add_argument("input", help="Nombre del archivo a descomprimir (.bin)")
+    p.add_argument("output", help="Nombre del WAV de salida")
+    p.add_argument("--original", help="WAV original para comparar metricas (opcional)", default=None)
     args = p.parse_args()
 
     decompress_raw(args.input, args.output, original_wav=args.original)
