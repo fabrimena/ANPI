@@ -1,9 +1,4 @@
 """
-Compact raw compressor faithful to paper but storing the sensed matrix Y in a small binary file.
-
-Usage:
-  python compress_cs_paper_raw.py input.wav out.bin --rate 0.30 --quantize
-
 Notes:
   - Header is minimal (magic, version, quant flag, seed, k,n,m,num_frames,fs,orig_len,scale)
   - Payload is int8 (if quantize) or float32 otherwise
@@ -188,4 +183,5 @@ if __name__ == "__main__":
     args = p.parse_args()
 
     compress_raw(args.input, args.output, k=args.k, n=args.n, rate=args.rate, seed=args.seed, quantize=args.quant)
+
 
