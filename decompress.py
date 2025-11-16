@@ -158,18 +158,37 @@ def decompress_raw(binfile, out_wav="reconstructed_raw.wav", original_wav=None):
 
     # Algorithm 2: Reconstruir X_hat = Y · A+ donde Y:(m×n), A+:(n×k) -> X:(m×k)
     X_all = np.empty((num_frames, m, k), dtype=np.float64)
+    
+    # Indices del medio del audio para mostrar (evitar inicio con silencios)
+    mid_start = num_frames // 2 - 1
+    sample_indices = [mid_start, mid_start + 1, mid_start + 2]
+    
     for i in range(num_frames):
         Yf = Y_all[i]       # (m, n) - frame comprimido
         X_all[i] = Yf @ A_pinv  # (m, n) @ (n, k) = (m, k) - reconstruido
-        
-        if i < 3 or i == num_frames - 1:
-            print(f"Frame {i+1} reconstruido: ||X̂||_F = {np.linalg.norm(X_all[i], 'fro'):.6f}")
 
     # Algorithm 2: Unir todos los frames y reshape a vector 1D
     # X_all shape: (num_frames, m, k)
     recon = X_all.reshape(num_frames * m * k)[:orig_len]
     
     recon_time = time.time() - recon_start_time
+    
+    print(f"\n    Mostrando 3 matrices del medio del audio (frames {mid_start+1}, {mid_start+2}, {mid_start+3}):")
+    print("    " + "="*65)
+    
+    for idx, frame_idx in enumerate(sample_indices, 1):
+        Y = Y_all[frame_idx]
+        X_hat = X_all[frame_idx]
+        print(f"\n    MATRIZ {idx} - Frame {frame_idx+1}:")
+        print(f"    Matriz Comprimida Y ({m}×{n}):")
+        for row in Y:
+            print(f"        [{', '.join(f'{val:9.6f}' for val in row)}]")
+        print(f"\n    Matriz Reconstruida X̂ ({m}×{k}):")
+        for row in X_hat:
+            print(f"        [{', '.join(f'{val:9.6f}' for val in row)}]")
+        print(f"    ||Y||_F = {np.linalg.norm(Y, 'fro'):.6f} → ||X̂||_F = {np.linalg.norm(X_hat, 'fro'):.6f}")
+    
+    print("    " + "="*65)
     
     print(f"\nTiempo de reconstrucción: {recon_time:.6f} segundos")
     print("=" * 70 + "\n")
