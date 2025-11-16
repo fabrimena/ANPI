@@ -1,227 +1,191 @@
+# compress_cs_paper_raw.py
+"""
+Compact raw compressor faithful to paper but storing the sensed matrix Y in a small binary file.
+
+Usage:
+  python compress_cs_paper_raw.py input.wav out.bin --rate 0.30 --quantize
+
+Notes:
+  - Header is minimal (magic, version, quant flag, seed, k,n,m,num_frames,fs,orig_len,scale)
+  - Payload is int8 (if quantize) or float32 otherwise
+  - Default frame shape follows paper example: k=8, n=4 (32 samples per frame)
+"""
 import numpy as np
-import soundfile as sf
-from scipy.fftpack import dct
-import time
-import pickle
+from scipy.io import wavfile
+import struct
+import argparse
 import os
-import warnings
-warnings.filterwarnings('ignore')
+import time
 
-class AudioCompressor:
+MAGIC = b'CSRB'   # 4 bytes magic
+VERSION = 1
+
+def frame_matrix(signal, m, k):
+    """Divide señal en frames de (m×k) como especifica el paper
+    Algorithm 1: cada frame contiene m×k muestras
     """
-    Compresion de audio usando Compressive Sensing + DCT
-    Basado en el paper: "Provably secure and efficient audio compression 
-    based on compressive sensing" (Abood et al., 2023)
-    """
+    frame_len = m * k
+    num_frames = len(signal) // frame_len
+    signal = signal[:num_frames * frame_len]
+    frames = signal.reshape(num_frames, m, k)  # (num_frames, m, k)
+    return frames, num_frames
+
+def compress_raw(in_wav, out_bin, k=8, n=4, rate=0.5, seed=None, quantize=True):
+    if seed is None:
+        seed = np.random.randint(0, 2**31 - 1)
+    np.random.seed(seed)
+
+    fs, sig = wavfile.read(in_wav)
     
-    def __init__(self, compression_rate=0.5, frame_size=1024):
-        self.compression_rate = compression_rate
-        self.frame_size = frame_size
-        self.num_coeffs = int(frame_size * compression_rate)
-        self.seed = None
+    print("\n" + "="*70)
+    print("INFORMACIÓN DEL AUDIO DE ENTRADA")
+    print("="*70)
+    print(f"Archivo: {in_wav}")
+    print(f"Sample rate: {fs} Hz")
+    
+    # Detectar si es estéreo o mono
+    is_stereo = sig.ndim > 1 and sig.shape[1] == 2
+    
+    if is_stereo:
+        print(f"Canales: Estéreo (2 canales)")
+        print(f"Muestras originales: {sig.shape[0]} × 2 = {sig.shape[0] * 2:,} valores")
+        # Para estéreo: tomar SOLO canal izquierdo (mejor que promedio)
+        # Esto preserva la estructura original de la señal
+        sig = sig[:, 0]
+        print("Preprocesamiento: usando canal izquierdo para CS")
+    else:
+        print(f"Canales: Mono (1 canal)")
+        print(f"Muestras originales: {len(sig):,} valores")
+    print("="*70)
+    
+    # normalize to [-1,1]
+    if np.issubdtype(sig.dtype, np.integer):
+        sig_f = sig.astype(np.float64) / np.iinfo(sig.dtype).max
+    else:
+        sig_f = sig.astype(np.float64)
+
+    original_length = len(sig_f)
+
+    # Algorithm 1 del paper:
+    # m from rate (paper: rate=0.30 -> m=3, rate=0.50 -> m=4 para k=8)
+    m = int(round(k * rate))
+    if m < 1 or m >= k:
+        raise ValueError("Rate produce m fuera de rango. Usa rate compatible con k.")
+    
+    # Verificar condición del paper: k>m y k>n
+    if not (k > m and k > n):
+        raise ValueError(f"Paper requiere k>m y k>n. Actual: k={k}, m={m}, n={n}")
+
+    # Dividir señal en frames de (m×k) como especifica Algorithm 1
+    frames_raw, num_frames = frame_matrix(sig_f, m, k)
+    if num_frames == 0:
+        raise ValueError("Audio demasiado corto para m*k.")
+
+    # ========== COMPRESIÓN MEDIANTE COMPRESSIVE SENSING (CS) ==========
+    print("\n" + "="*70)
+    print("COMPRESIÓN CS: Generación de Matriz de Medición y Aplicación")
+    print("="*70)
+    
+    # Matriz de medición (k×n) como indica el paper
+    print("\n[1] GENERACIÓN DE MATRIZ DE MEDICIÓN:")
+    print(f"    Seed (para reproducibilidad): {seed}")
+    A = np.random.randn(k, n).astype(np.float64)
+    print(f"    A shape: ({k}×{n}) - Matriz de medición gaussiana")
+    print(f"    A primeros elementos: {A.flat[:5]}")
+    
+    print(f"\n[2] PARÁMETROS DE COMPRESIÓN:")
+    print(f"    Frames originales X: ({m}×{k}) cada uno")
+    print(f"    Matriz de medición A: ({k}×{n})")
+    print(f"    Frames comprimidos Y: ({m}×{n}) cada uno")
+    print(f"    Total de frames: {num_frames}")
+    print(f"    Reducción de dimensión: {m*k} → {m*n} ({100*(1-n/k):.1f}% menos columnas)")
+    
+    # Algorithm 1: Y = X·A donde X:(m×k), A:(k×n) -> Y:(m×n)
+    print(f"\n[3] PROCESO DE COMPRESIÓN (Y = X·A):")
+    start_time = time.time()
+    
+    Y_all = np.empty((num_frames, m, n), dtype=np.float64)
+    for i in range(num_frames):
+        X = frames_raw[i]    # X shape (m, k) - frame original
+        Y = X @ A            # (m, k) @ (k, n) = (m, n) - comprimido
+        Y_all[i] = Y
         
-        print(f"Configuracion de compresion:")
-        print(f"  - Frame size: {self.frame_size}")
-        print(f"  - Coeficientes: {self.num_coeffs} ({compression_rate*100}%)")
-        print(f"  - DCT: Activado")
+        if i < 3 or i == num_frames - 1:
+            print(f"    Frame {i+1}: ||X||_F = {np.linalg.norm(X, 'fro'):.6f} → ||Y||_F = {np.linalg.norm(Y, 'fro'):.6f}")
     
-    def preprocess_audio(self, audio_signal):
-        """Pre-procesamiento para mejorar SNR"""
-        max_val = np.max(np.abs(audio_signal))
-        if max_val > 0:
-            normalized = audio_signal / max_val
+    compression_time = time.time() - start_time
+    
+    print(f"\n[4] TIEMPO DE COMPRESIÓN:")
+    print(f"    t = {compression_time:.6f} segundos")
+    print("="*70 + "\n")
+
+    # quantize if requested
+    quant_flag = 1 if quantize else 0
+    if quantize:
+        max_abs = float(np.max(np.abs(Y_all)))
+        if max_abs == 0:
+            scale = 1.0
         else:
-            normalized = audio_signal
-        
-        return normalized, max_val
-    
-    def generate_measurement_matrix(self, seed=None):
-        """Genera matriz Gaussiana como en el paper (Seccion 4)"""
-        if seed is None:
-            self.seed = np.random.randint(0, 2**31)
+            scale = max_abs / 127.0   # map to int8 range
+        Y_norm = Y_all / scale
+        Y_q = np.round(Y_norm).astype(np.int8)  # values -128..127 (but scale ensures within -127..127)
+        payload_size = Y_q.size  # bytes
+    else:
+        scale = 0.0
+        Y_f = Y_all.astype(np.float32)
+        payload_size = Y_f.size * 4
+
+    # Write binary file
+    with open(out_bin, 'wb') as f:
+        # header: magic(4), version(1), quant(1), seed(4), k(2), n(2), m(2), num_frames(4), fs(4), orig_len(4), scale(4)
+        header = struct.pack('<4sBBIHHHIII f',
+                             MAGIC,
+                             VERSION,
+                             quant_flag,
+                             seed,
+                             k,
+                             n,
+                             m,
+                             num_frames,
+                             fs,
+                             original_length,
+                             scale)
+        # Note: struct '<4sBBIHHHIII f' packs to size 4+1+1+4+2+2+2+4+4+4+4 = 32 bytes
+        f.write(header)
+
+        # payload
+        if quantize:
+            # write raw bytes of int8 in C order
+            f.write(Y_q.tobytes(order='C'))
         else:
-            self.seed = seed
-        
-        np.random.seed(self.seed)
-        matrix = np.random.randn(self.num_coeffs, self.num_coeffs)
-        matrix = matrix / np.sqrt(self.num_coeffs)
-        
-        return matrix
-    
-    def compress_audio(self, audio_signal):
-        """
-        Compresion usando CS + DCT (Algorithm 1 del paper):
-        1. Pre-procesar y dividir en frames
-        2. DCT en cada frame para obtener representacion dispersa
-        3. Tomar primeros N coeficientes DCT
-        4. Multiplicar por matriz de medicion Gaussiana
-        """
-        start_time = time.time()
-        
-        processed_signal, max_val = self.preprocess_audio(audio_signal)
-        measurement_matrix = self.generate_measurement_matrix()
-        
-        original_length = len(audio_signal)
-        
-        # Padding con reflexion
-        pad_length = self.frame_size - (len(processed_signal) % self.frame_size)
-        if pad_length != self.frame_size:
-            processed_signal = np.pad(processed_signal, (0, pad_length), mode='reflect')
-        
-        # Dividir en frames (matrices pequenas como en el paper)
-        num_frames = len(processed_signal) // self.frame_size
-        frames = processed_signal.reshape(num_frames, self.frame_size)
-        
-        compressed_frames = []
-        
-        for frame in frames:
-            # Aplicar DCT para obtener coeficientes dispersos
-            dct_coeffs = dct(frame, norm='ortho')
-            sparse_coeffs = dct_coeffs[:self.num_coeffs]
-            
-            # Multiplicar por matriz de medicion (Y = A * X)
-            encrypted_coeffs = measurement_matrix @ sparse_coeffs
-            compressed_frames.append(encrypted_coeffs)
-        
-        compressed_signal = np.concatenate(compressed_frames)
-        
-        stats = {
-            'original_length': original_length,
-            'compressed_length': len(compressed_signal),
-            'compression_ratio': len(compressed_signal) / original_length,
-            'compression_time': time.time() - start_time,
-            'num_frames': num_frames,
-            'seed': self.seed,
-            'max_val': max_val
-        }
-        
-        return compressed_signal, stats
-    
-    def save_compressed(self, compressed_signal, stats, filename="audio_compressed.pkl"):
-        """Guarda datos comprimidos + metadatos"""
-        max_compressed = np.max(np.abs(compressed_signal))
-        if max_compressed > 0:
-            normalized = compressed_signal / max_compressed
-        else:
-            normalized = compressed_signal
-        
-        compressed_int16 = (normalized * 32767).astype(np.int16)
-        
-        data_package = {
-            'compressed_data': compressed_int16,
-            'max_compressed': max_compressed,
-            'original_length': stats['original_length'],
-            'seed': stats['seed'],
-            'compression_rate': self.compression_rate,
-            'frame_size': self.frame_size,
-            'max_val': stats['max_val']
-        }
-        
-        with open(filename, 'wb') as f:
-            pickle.dump(data_package, f, protocol=pickle.HIGHEST_PROTOCOL)
-        
-        size = os.path.getsize(filename)
-        print(f"Archivo guardado: {filename} ({size:,} bytes, {size/1024:.2f} KB)")
-        
-        return size
+            f.write(Y_f.tobytes(order='C'))
 
+    orig_size = os.path.getsize(in_wav)
+    comp_size = os.path.getsize(out_bin)
+    
+    print("\n" + "="*70)
+    print("RESUMEN DE COMPRESIÓN")
+    print("="*70)
+    print(f"Archivo guardado: {out_bin}")
+    print(f"Tamaño original:  {orig_size:,} bytes")
+    print(f"Tamaño comprimido: {comp_size:,} bytes (payload ~ {payload_size:,} bytes)")
+    print(f"Ratio de compresión: {100*(1 - comp_size/orig_size):.2f}% reducción")
+    print(f"\nParámetros: k={k}, n={n}, m={m}, frames={num_frames}")
+    print(f"Seed: {seed}, Cuantización: {quantize}, Scale: {scale:.6g}")
+    print("="*70)
 
-def compress_audio_file(input_file, output_file=None, compression_rate=0.5, frame_size=1024):
-    """
-    Funcion principal para comprimir un archivo de audio
-    """
-    print("\n" + "=" * 70)
-    print("COMPRESION DE AUDIO CON COMPRESSIVE SENSING + DCT")
-    print("=" * 70)
-    
-    # Cargar audio
-    audio_signal, fs = sf.read(input_file)
-    if len(audio_signal.shape) > 1:
-        audio_signal = audio_signal[:, 0]
-    
-    original_size = os.path.getsize(input_file)
-    print(f"\nAudio original: {len(audio_signal)} muestras @ {fs} Hz")
-    print(f"Tamano: {original_size:,} bytes ({original_size/1024:.2f} KB)\n")
-    
-    # Crear compresor
-    compressor = AudioCompressor(
-        compression_rate=compression_rate,
-        frame_size=frame_size
-    )
-    
-    # Comprimir
-    print("\n" + "-" * 70)
-    print("COMPRIMIENDO...")
-    print("-" * 70)
-    compressed_signal, stats = compressor.compress_audio(audio_signal)
-    
-    print(f"Muestras: {stats['original_length']} -> {stats['compressed_length']}")
-    print(f"Ratio: {stats['compression_ratio']:.2%}")
-    print(f"Tiempo: {stats['compression_time']:.4f}s")
-    print(f"Semilla: {stats['seed']}\n")
-    
-    # Guardar
-    if output_file is None:
-        base_name = os.path.splitext(input_file)[0]
-        output_file = f"{base_name}_{int(compression_rate*100)}pct_f{frame_size}_dct.pkl"
-    
-    file_size = compressor.save_compressed(compressed_signal, stats, output_file)
-    
-    # Comparacion
-    reduction = (1 - file_size / original_size) * 100
-    
-    print(f"\n{'RESULTADO':^70}")
-    print("=" * 70)
-    print(f"Original:     {original_size:>10,} bytes ({original_size/1024:>7.2f} KB)")
-    print(f"Comprimido:   {file_size:>10,} bytes ({file_size/1024:>7.2f} KB)")
-    print(f"Reduccion:    {reduction:>10.2f}%")
-    print("=" * 70)
-    
-    print(f"\nCompresion completada: {output_file}\n")
-    
-    return output_file
-
+    return out_bin
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("\nUso: python compress.py <archivo_audio> [opciones]")
-        print("\nOpciones:")
-        print("  --rate RATE          Tasa de compresion (default: 0.5)")
-        print("  --frame FRAME        Tamano de frame (default: 1024)")
-        print("  --output ARCHIVO     Nombre de archivo de salida")
-        print("\nEjemplo:")
-        print("  python compress.py audio.wav")
-        print("  python compress.py audio.wav --rate 0.3 --frame 2048")
-        print("  python compress.py audio.wav --output compressed.pkl\n")
-        sys.exit(1)
-    
-    input_file = sys.argv[1]
-    
-    # Parsear opciones
-    compression_rate = 0.5
-    frame_size = 1024
-    output_file = None
-    
-    i = 2
-    while i < len(sys.argv):
-        if sys.argv[i] == '--rate':
-            compression_rate = float(sys.argv[i + 1])
-            i += 2
-        elif sys.argv[i] == '--frame':
-            frame_size = int(sys.argv[i + 1])
-            i += 2
-        elif sys.argv[i] == '--output':
-            output_file = sys.argv[i + 1]
-            i += 2
-        else:
-            i += 1
-    
-    # Comprimir
-    compress_audio_file(
-        input_file,
-        output_file=output_file,
-        compression_rate=compression_rate,
-        frame_size=frame_size
-    )
+    p = argparse.ArgumentParser(description="Compress audio (paper-style) into compact raw binary.")
+    p.add_argument("input", help="Input WAV")
+    p.add_argument("output", help="Output binary file (.bin)")
+    p.add_argument("--k", type=int, default=8, help="k (rows), default 8 as paper")
+    p.add_argument("--n", type=int, default=4, help="n (cols), default 4 as paper")
+    p.add_argument("--rate", type=float, default=0.5, help="compression ratio m/k (use 0.3 or 0.5 per paper)")
+    p.add_argument("--seed", type=int, default=None, help="RNG seed (optional)")
+    p.add_argument("--no-quant", dest="quant", action="store_false", help="Store Y as float32 (no quantization)")
+    p.set_defaults(quant=True)
+    args = p.parse_args()
+
+    compress_raw(args.input, args.output, k=args.k, n=args.n, rate=args.rate, seed=args.seed, quantize=args.quant)
