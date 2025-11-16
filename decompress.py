@@ -48,7 +48,7 @@ class AudioDecompressor:
         
         # Calcular pseudoinversa de Moore-Penrose (Ecuacion 6 del paper)
         # A+ = A^T * (A * A^T)^-1
-        pseudoinverse = np.linalg.inv(measurement_matrix)
+        pseudoinverse = np.linalg.pinv(measurement_matrix)
         
         # Dividir en frames
         num_frames = len(compressed_signal) // self.num_coeffs
@@ -318,4 +318,5 @@ if __name__ == "__main__":
         output_file=output_file,
         original_file=original_file,
         sample_rate=sample_rate
+
     )
